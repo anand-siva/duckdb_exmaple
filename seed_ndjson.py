@@ -7,34 +7,38 @@ import boto3
 import duckdb
 from botocore.client import Config
 
+from seed_transactions import (
+    DEFAULT_FILES,
+    DEFAULT_RECORDS_PER_FILE,
+    S3_ACCESS_KEY,
+    S3_ENDPOINT,
+    S3_REGION,
+    S3_SECRET_KEY,
+    configure_minio,
+    parse_s3_uri,
+    sql_string,
+    transaction_select,
+)
 
-DEFAULT_FILES = 1_000
-DEFAULT_RECORDS_PER_FILE = 100_000
-DEFAULT_OUTPUT = "s3://duckdb-demo/transactions/"
-S3_ENDPOINT = "http://localhost:9000"
-S3_ACCESS_KEY = "admin"
-S3_SECRET_KEY = "password123"
-S3_REGION = "us-east-1"
+
+DEFAULT_OUTPUT = "s3://duckdb-demo/transactions-ndjson/"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate synthetic transactions and write them to Parquet with DuckDB."
+        description="Generate synthetic transactions and write them as NDJSON with DuckDB."
     )
     parser.add_argument(
         "--files",
         type=int,
         default=DEFAULT_FILES,
-        help=f"number of Parquet objects to create (default: {DEFAULT_FILES:,})",
+        help=f"number of NDJSON objects to create (default: {DEFAULT_FILES:,})",
     )
     parser.add_argument(
         "--records-per-file",
         type=int,
         default=DEFAULT_RECORDS_PER_FILE,
-        help=(
-            "transactions per Parquet object "
-            f"(default: {DEFAULT_RECORDS_PER_FILE:,})"
-        ),
+        help=f"transactions per object (default: {DEFAULT_RECORDS_PER_FILE:,})",
     )
     parser.add_argument(
         "--output",
@@ -49,59 +53,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--records-per-file must be greater than zero")
 
     return args
-
-
-def sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def parse_s3_uri(uri: str) -> tuple[str, str]:
-    if not uri.startswith("s3://"):
-        raise SystemExit("--output must be an s3:// URI")
-
-    bucket_and_key = uri.removeprefix("s3://").split("/", 1)
-    if len(bucket_and_key) != 2 or not all(bucket_and_key):
-        raise SystemExit("--output must include both a bucket and an object prefix")
-
-    return bucket_and_key[0], bucket_and_key[1]
-
-
-def configure_minio(connection: duckdb.DuckDBPyConnection) -> None:
-    connection.execute("INSTALL httpfs")
-    connection.execute("LOAD httpfs")
-    connection.execute(
-        f"""
-        CREATE OR REPLACE SECRET minio (
-            TYPE s3,
-            KEY_ID {sql_string(S3_ACCESS_KEY)},
-            SECRET {sql_string(S3_SECRET_KEY)},
-            REGION {sql_string(S3_REGION)},
-            ENDPOINT 'localhost:9000',
-            URL_STYLE 'path',
-            USE_SSL false
-        )
-        """
-    )
-
-
-def transaction_select(first_id: int, record_count: int) -> str:
-    return f"""
-        SELECT
-            md5(i::VARCHAR) AS transaction_id,
-            (1 + hash(i * 17) % 10000000)::INTEGER AS customer_id,
-            list_extract(
-                ['MD', 'VA', 'PA', 'NY', 'CA', 'TX', 'FL', 'IL', 'WA', 'NC'],
-                (1 + hash(i * 23) % 10)::INTEGER
-            ) AS state,
-            list_extract(
-                ['electronics', 'clothing', 'books', 'home', 'grocery', 'sports'],
-                (1 + hash(i * 29) % 6)::INTEGER
-            ) AS product_category,
-            (5 + (hash(i * 31) % 49501) / 100.0)::DECIMAL(10, 2) AS amount,
-            TIMESTAMP '2026-01-01 00:00:00'
-                + (hash(i * 37) % 31536000) * INTERVAL '1 second' AS created_at
-        FROM range({first_id}, {first_id + record_count}) AS transactions(i)
-    """
 
 
 def main() -> None:
@@ -123,25 +74,23 @@ def main() -> None:
     if bucket not in existing_buckets:
         s3.create_bucket(Bucket=bucket)
 
-    # The prefix contains only generated data, so rerunning replaces the dataset.
     while True:
         page = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)
         objects = [{"Key": item["Key"]} for item in page.get("Contents", [])]
-        if objects:
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
-        else:
+        if not objects:
             break
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
 
     started = time.perf_counter()
     print(f"Creating {total_records:,} records")
-    print(f"Writing {args.files:,} Zstandard-compressed Parquet objects to {output_uri}")
+    print(f"Writing {args.files:,} uncompressed NDJSON objects to {output_uri}")
 
     connection = duckdb.connect(":memory:")
     try:
         configure_minio(connection)
         for file_number in range(args.files):
             first_id = file_number * args.records_per_file
-            key = f"{prefix}part-{file_number:05d}.parquet"
+            key = f"{prefix}part-{file_number:05d}.ndjson"
             uri = f"s3://{bucket}/{key}"
             file_started = time.perf_counter()
 
@@ -150,7 +99,7 @@ def main() -> None:
                 COPY (
                     {transaction_select(first_id, args.records_per_file)}
                 ) TO {sql_string(uri)}
-                (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
+                (FORMAT JSON, ARRAY false)
                 """
             )
 
@@ -164,7 +113,6 @@ def main() -> None:
     finally:
         connection.close()
 
-    elapsed = time.perf_counter() - started
     total_bytes = 0
     object_count = 0
     paginator = s3.get_paginator("list_objects_v2")
@@ -172,13 +120,13 @@ def main() -> None:
         contents = page.get("Contents", [])
         object_count += len(contents)
         total_bytes += sum(item["Size"] for item in contents)
-    size_gib = total_bytes / (1024**3)
 
+    elapsed = time.perf_counter() - started
     print()
     print("Done.")
     print(f"Total records: {total_records:,}")
     print(f"Total files: {object_count:,}")
-    print(f"Total size: {size_gib:,.2f} GiB")
+    print(f"Total size: {total_bytes / (1024**3):,.2f} GiB")
     print(f"Total time: {elapsed:.2f}s")
     print(f"Average throughput: {total_records / elapsed:,.0f} records/sec")
 
