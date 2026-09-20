@@ -39,6 +39,3 @@ data/
 # Environment variables
 .env
 .env.*
-
-# MinIO local storage (if mounted locally)
-minio_data/
